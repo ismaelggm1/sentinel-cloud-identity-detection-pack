@@ -117,7 +117,7 @@ AuditLogs
 
 ## 💰 Full Pack — 20 Rules + Docs
 
-**[→ Buy on Gumroad](https://gumroad.com)** — €39
+**[→ Buy on Gumroad](ismaelggm.gumroad.com/l/hectdg)** — €39
 
 Includes all 20 rules + MITRE mapping + deployment guide + connector setup + response playbooks.
 
