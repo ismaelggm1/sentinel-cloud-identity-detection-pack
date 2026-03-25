@@ -1,0 +1,306 @@
+// ============================================================
+// RULE: M365-001 — Mailbox Forwarding Rule Created to External Address
+// ============================================================
+// MITRE ATT&CK:  T1114.003 — Email Collection: Email Forwarding Rule
+// Severity:      HIGH
+// Data Source:   OfficeActivity (Microsoft 365 connector)
+// Frequency:     Every 15 minutes | Lookback: 1 hour
+// Author:        Ismael Gaton
+//
+// Description:
+//   Detects inbox rules that forward emails to external addresses.
+//   This is the #1 post-compromise action attackers take after
+//   gaining M365 access — silent email forwarding for intelligence
+//   gathering or BEC (Business Email Compromise) preparation.
+//   In SMEs, this rule almost never has legitimate false positives.
+// ============================================================
+
+// --- CONFIGURATION ---
+let LookbackWindow = 1h;
+let InternalDomain = "yourdomain.com";  // Replace with your domain
+// --- END CONFIGURATION ---
+
+OfficeActivity
+| where TimeGenerated > ago(LookbackWindow)
+| where Operation in ("New-InboxRule", "Set-InboxRule", "UpdateInboxRules")
+| extend RuleDetails = tostring(Parameters)
+| where RuleDetails has_any (
+    "ForwardTo", "RedirectTo", "ForwardAsAttachmentTo"
+)
+| where not (RuleDetails has InternalDomain)
+| extend
+    AlertTitle = "Mailbox forwarding rule set to external address — BEC/espionage indicator",
+    Severity = "High",
+    MITRE_Tactic = "Collection",
+    MITRE_Technique = "T1114.003"
+| project
+    TimeGenerated, UserId, ClientIP, Operation,
+    RuleDetails, AlertTitle, Severity, MITRE_Tactic, MITRE_Technique
+
+// ============================================================
+// TUNING NOTES:
+//   - Update InternalDomain with your actual domain to avoid flagging
+//     internal forwarding rules (e.g., to a shared mailbox)
+//   - HR/executive assistants sometimes set up legitimate forwarding.
+//     Verify with the user before escalating.
+//   - Also check for rules that DELETE emails (attackers hide their tracks):
+//     | where RuleDetails has_any ("DeleteMessage", "MarkAsRead", "MoveToFolder")
+//
+// RESPONSE:
+//   1. IMMEDIATELY check where emails are being forwarded to
+//   2. Delete the forwarding rule via Exchange Admin Center or PowerShell
+//   3. Assess how long the rule was active — what may have been forwarded?
+//   4. Check for BEC indicators: were any financial/vendor emails sent?
+//   5. Notify the user and check if their account was compromised
+// ============================================================
+
+
+// ============================================================
+// RULE: M365-002 — OAuth Application Granted Suspicious Permissions
+// ============================================================
+// MITRE ATT&CK:  T1550.001 — Use Alternate Authentication: Application Access Token
+// Severity:      HIGH
+// Data Source:   AuditLogs (Azure Active Directory)
+// Frequency:     Every 1 hour | Lookback: 2 hours
+// Author:        Ismael Gaton
+//
+// Description:
+//   Detects OAuth applications granted high-risk permissions to M365 data.
+//   Consent phishing attacks trick users into approving malicious apps
+//   that can read all their mail, files, and contacts — without needing
+//   their password and persisting even after password resets.
+// ============================================================
+
+// --- CONFIGURATION ---
+let LookbackWindow = 2h;
+let HighRiskPermissions = dynamic([
+    "Mail.ReadWrite", "Mail.Read", "Mail.Send",
+    "Files.ReadWrite.All", "Files.Read.All",
+    "Directory.ReadWrite.All", "Directory.Read.All",
+    "User.ReadWrite.All", "Calendars.ReadWrite",
+    "full_access_as_user", "EWS.AccessAsUser.All",
+    "Sites.ReadWrite.All", "RoleManagement.ReadWrite.Directory"
+]);
+// --- END CONFIGURATION ---
+
+AuditLogs
+| where TimeGenerated > ago(LookbackWindow)
+| where OperationName in (
+    "Consent to application",
+    "Add app role assignment to service principal",
+    "Add delegated permission grant"
+)
+| extend
+    Actor = tostring(InitiatedBy.user.userPrincipalName),
+    AppName = tostring(TargetResources[0].displayName),
+    PermissionsGranted = tostring(AdditionalDetails)
+| where PermissionsGranted has_any (HighRiskPermissions)
+| extend
+    AlertTitle = strcat("High-risk OAuth permissions granted to: ", AppName),
+    Severity = "High",
+    MITRE_Tactic = "Initial Access",
+    MITRE_Technique = "T1550.001"
+| project
+    TimeGenerated, Actor, AppName,
+    PermissionsGranted, OperationName,
+    AlertTitle, Severity, MITRE_Tactic, MITRE_Technique
+
+// ============================================================
+// TUNING NOTES:
+//   - Legitimate app integrations (Salesforce, Slack, Zoom) will trigger.
+//     Maintain an approved app list and exclude those AppNames.
+//   - The key red flags: unknown AppName + Mail.ReadWrite or Directory access
+//   - Enable the Azure AD "Admin consent workflow" so users can't self-approve
+//     high-risk permissions — this massively reduces this attack surface.
+//
+// RESPONSE:
+//   1. Check if the app is a known/approved integration
+//   2. If unknown: revoke consent immediately
+//      Azure AD > Enterprise Apps > [App] > Permissions > Revoke
+//   3. Check what data the app may have accessed via the app's API logs
+//   4. Notify the user — they may have been phished into approving it
+//   5. Enable admin consent requirement for all apps in Azure AD settings
+// ============================================================
+
+
+// ============================================================
+// RULE: M365-003 — Mass Email Delete or Purge Activity
+// ============================================================
+// MITRE ATT&CK:  T1070.008 — Indicator Removal: Clear Mailbox Data
+// Severity:      MEDIUM
+// Data Source:   OfficeActivity (Microsoft 365)
+// Frequency:     Every 1 hour | Lookback: 2 hours
+// Author:        Ismael Gaton
+//
+// Description:
+//   Detects bulk email deletion — either an attacker cleaning evidence
+//   or a compromised account being used for mailbox destruction.
+//   Also relevant for insider threat scenarios in SMEs.
+// ============================================================
+
+// --- CONFIGURATION ---
+let LookbackWindow = 2h;
+let BulkDeleteThreshold = 50;  // Emails deleted in the lookback window
+// --- END CONFIGURATION ---
+
+OfficeActivity
+| where TimeGenerated > ago(LookbackWindow)
+| where Operation in (
+    "SoftDelete", "HardDelete", "MoveToDeletedItems",
+    "Purge", "RecordDelete"
+)
+| summarize
+    DeleteCount = count(),
+    Operations = make_set(Operation),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated)
+    by UserId, ClientIP
+| where DeleteCount >= BulkDeleteThreshold
+| extend
+    DurationMinutes = datetime_diff('minute', LastSeen, FirstSeen),
+    AlertTitle = "Mass email deletion detected — possible evidence removal or account abuse",
+    Severity = "Medium",
+    MITRE_Tactic = "Defense Evasion",
+    MITRE_Technique = "T1070.008"
+| project
+    FirstSeen, LastSeen, DurationMinutes,
+    UserId, ClientIP, DeleteCount, Operations,
+    AlertTitle, Severity, MITRE_Tactic, MITRE_Technique
+
+// ============================================================
+// TUNING NOTES:
+//   - Email migration or cleanup projects will trigger this.
+//     Coordinate with IT and exclude during known migration windows.
+//   - HardDelete and Purge operations are higher confidence than SoftDelete.
+//   - Off-hours bulk deletion is a strong indicator of malicious activity.
+//
+// RESPONSE:
+//   1. Contact the user — are they knowingly deleting emails?
+//   2. If unauthorized: use eDiscovery or Content Search to recover items
+//   3. Check if the same IP shows suspicious activity elsewhere
+//   4. Consider enabling Litigation Hold on executive/sensitive mailboxes
+// ============================================================
+
+
+// ============================================================
+// RULE: M365-004 — New External Teams Guest Added
+// ============================================================
+// MITRE ATT&CK:  T1534 — Internal Spearphishing
+// Severity:      LOW
+// Data Source:   OfficeActivity (Microsoft 365 / Teams)
+// Frequency:     Every 4 hours | Lookback: 4 hours
+// Author:        Ismael Gaton
+//
+// Description:
+//   Detects external guest users added to Microsoft Teams channels.
+//   External guests can access files, chats, and channel history.
+//   In SMEs, uncontrolled guest access is a common data leakage path
+//   and is also used by attackers who compromise a supplier account.
+// ============================================================
+
+// --- CONFIGURATION ---
+let LookbackWindow = 4h;
+let InternalDomain = "yourdomain.com";  // Replace with your domain
+// --- END CONFIGURATION ---
+
+OfficeActivity
+| where TimeGenerated > ago(LookbackWindow)
+| where Operation in (
+    "MemberAdded", "TeamGuestEnabled",
+    "AddedToGroup", "GuestAccepted"
+)
+| where RecordType == "MicrosoftTeams"
+| extend
+    AddedUser = tostring(Members[0].UPN),
+    AddedBy = UserId,
+    TeamName = tostring(TeamName)
+| where isnotempty(AddedUser)
+| where AddedUser !endswith InternalDomain
+| extend
+    AlertTitle = strcat("External guest added to Teams: ", AddedUser),
+    Severity = "Low",
+    MITRE_Tactic = "Initial Access",
+    MITRE_Technique = "T1534"
+| project
+    TimeGenerated, AddedBy, AddedUser, TeamName,
+    ClientIP, AlertTitle, Severity, MITRE_Tactic, MITRE_Technique
+
+// ============================================================
+// TUNING NOTES:
+//   - Guest access is sometimes legitimate (partners, contractors).
+//     The value here is visibility, not blocking — know who has access.
+//   - Focus on guests added to teams containing sensitive data
+//     (Finance, HR, Executive channels).
+//   - Review the AddedBy field — was it the right person doing this?
+//
+// RESPONSE:
+//   1. Verify the guest addition was authorized by a manager
+//   2. Check what Teams/channels the guest now has access to
+//   3. If unauthorized: remove the guest from all Teams
+//      Azure AD > External Identities > [Guest] > Remove
+//   4. Review your Teams external access policies if this is recurring
+// ============================================================
+
+
+// ============================================================
+// RULE: M365-005 — SharePoint / OneDrive Mass File Download
+// ============================================================
+// MITRE ATT&CK:  T1039 — Data from Network Shared Drive
+// Severity:      MEDIUM
+// Data Source:   OfficeActivity (Microsoft 365)
+// Frequency:     Every 1 hour | Lookback: 2 hours
+// Author:        Ismael Gaton
+//
+// Description:
+//   Detects bulk file downloads from SharePoint or OneDrive.
+//   A compromised account or malicious insider will bulk-download
+//   company files before exfiltrating them or leaking to competitors.
+//   The volume threshold is set conservatively for SME file volumes.
+// ============================================================
+
+// --- CONFIGURATION ---
+let LookbackWindow = 2h;
+let DownloadThreshold = 50;  // Lower for sensitive orgs, raise for high-volume teams
+// --- END CONFIGURATION ---
+
+OfficeActivity
+| where TimeGenerated > ago(LookbackWindow)
+| where RecordType in ("SharePointFileOperation", "OneDrive")
+| where Operation in ("FileDownloaded", "FileSyncDownloadedFull")
+| summarize
+    DownloadCount = count(),
+    FileTypes = make_set(tostring(split(OfficeObjectId, ".")[-1]), 20),
+    Sites = make_set(SiteUrl, 10),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated)
+    by UserId, ClientIP
+| where DownloadCount >= DownloadThreshold
+| extend
+    DurationMinutes = datetime_diff('minute', LastSeen, FirstSeen),
+    AlertTitle = "Mass file download from SharePoint/OneDrive — possible data staging",
+    Severity = "Medium",
+    MITRE_Tactic = "Collection",
+    MITRE_Technique = "T1039"
+| project
+    FirstSeen, LastSeen, DurationMinutes,
+    UserId, ClientIP, DownloadCount, FileTypes, Sites,
+    AlertTitle, Severity, MITRE_Tactic, MITRE_Technique
+| order by DownloadCount desc
+
+// ============================================================
+// TUNING NOTES:
+//   - Sync clients (OneDrive desktop) do bulk downloads on first setup.
+//     Correlate with new device registrations to identify sync FPs.
+//   - Look at FileTypes — .xlsx, .docx, .pdf in bulk is more suspicious
+//     than image files during a sync.
+//   - Off-hours bulk downloads from unusual IPs are highest confidence.
+//   - Employees downloading everything before resigning is an insider
+//     threat pattern — correlate with HR offboarding notices.
+//
+// RESPONSE:
+//   1. Identify the files downloaded — were they sensitive?
+//   2. Check if the downloads were followed by external transfers
+//      (correlate with network logs or CASB if available)
+//   3. Contact the user's manager to verify legitimacy
+//   4. If malicious: revoke access, preserve evidence, legal/HR involvement
+// ============================================================

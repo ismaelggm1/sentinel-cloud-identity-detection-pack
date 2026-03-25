@@ -1,0 +1,249 @@
+// ============================================================
+// RULE: ID-001 — MFA Fatigue Attack Detection
+// ============================================================
+// MITRE ATT&CK:  T1621 — Multi-Factor Authentication Request Generation
+// Severity:      HIGH
+// Data Source:   SigninLogs (Azure Active Directory)
+// Frequency:     Every 15 minutes | Lookback: 1 hour
+// Author:        Ismael Gaton
+//
+// Description:
+//   Detects MFA fatigue attacks — flooding a user with MFA push
+//   notifications hoping they approve out of frustration.
+//   This technique compromised Uber, Cisco, and many SMEs.
+//   Extremely relevant for organizations using Microsoft Authenticator push.
+// ============================================================
+
+// --- CONFIGURATION ---
+let LookbackWindow = 1h;
+let MFADenialThreshold = 5;  // Number of MFA denials before alerting
+// --- END CONFIGURATION ---
+
+SigninLogs
+| where TimeGenerated > ago(LookbackWindow)
+| where ResultType != 0
+| where ResultDescription has_any (
+    "MFA denied", "MFA requirement satisfied by claim",
+    "user did not pass the MFA challenge",
+    "strong authentication is required",
+    "proof up", "MFA fraud"
+) or Status has "MFA"
+| where AuthenticationRequirement == "multiFactorAuthentication"
+| summarize
+    MFADenials = count(),
+    SourceIPs = make_set(IPAddress),
+    AppTargeted = make_set(AppDisplayName),
+    FirstAttempt = min(TimeGenerated),
+    LastAttempt = max(TimeGenerated)
+    by UserPrincipalName
+| where MFADenials >= MFADenialThreshold
+| extend
+    DurationMinutes = datetime_diff('minute', LastAttempt, FirstAttempt),
+    AlertTitle = "MFA fatigue attack — repeated MFA denials for same user",
+    Severity = "High",
+    MITRE_Tactic = "Credential Access",
+    MITRE_Technique = "T1621"
+| project
+    FirstAttempt, LastAttempt, DurationMinutes,
+    UserPrincipalName, MFADenials, SourceIPs,
+    AppTargeted, AlertTitle, Severity, MITRE_Tactic, MITRE_Technique
+| order by MFADenials desc
+
+// ============================================================
+// TUNING NOTES:
+//   - Users who genuinely fat-finger MFA may trigger at lower thresholds.
+//     Raise MFADenialThreshold to 8-10 if FPs are high.
+//   - Check SourceIPs — if denials come from multiple IPs it's more
+//     suspicious (botnet-assisted spray + fatigue combo).
+//   - After a fatigue attack, ALWAYS check if there was eventually
+//     a successful sign-in — means the user approved under pressure.
+//
+// RESPONSE:
+//   1. Contact the user IMMEDIATELY — are they getting unexpected MFA prompts?
+//   2. Temporarily block the source IPs in Conditional Access
+//   3. Enable number matching in Microsoft Authenticator (prevents fatigue)
+//   4. Check if any successful sign-in followed the denials
+//   5. Consider switching from push notifications to FIDO2 keys for admins
+// ============================================================
+
+
+// ============================================================
+// RULE: ID-002 — Legacy Authentication Protocol Sign-In
+// ============================================================
+// MITRE ATT&CK:  T1078 — Valid Accounts (via legacy auth bypass)
+// Severity:      MEDIUM
+// Data Source:   SigninLogs (Azure Active Directory)
+// Frequency:     Every 1 hour | Lookback: 2 hours
+// Author:        Ismael Gaton
+//
+// Description:
+//   Detects successful sign-ins via legacy authentication protocols
+//   (SMTP, IMAP, POP3, BasicAuth). These protocols bypass MFA entirely,
+//   making them the preferred vector for password spray attacks.
+//   In 2024-2025, legacy auth abuse remains the #1 M365 attack vector.
+// ============================================================
+
+// --- CONFIGURATION ---
+let LookbackWindow = 2h;
+// Accounts that legitimately need legacy auth (ideally none — migrate them)
+let LegacyAuthExclusions = dynamic([]);
+// --- END CONFIGURATION ---
+
+SigninLogs
+| where TimeGenerated > ago(LookbackWindow)
+| where ResultType == 0  // Successful sign-in
+| where ClientAppUsed in (
+    "Exchange ActiveSync", "IMAP", "MAPI", "SMTP",
+    "POP3", "Other clients", "Authenticated SMTP",
+    "Exchange Online PowerShell"
+) or AuthenticationProtocol in ("basic", "legacyAuth")
+| where UserPrincipalName !in~ (LegacyAuthExclusions)
+| extend
+    AlertTitle = "Successful legacy auth sign-in — MFA was bypassed",
+    Severity = "Medium",
+    MITRE_Tactic = "Initial Access",
+    MITRE_Technique = "T1078"
+| project
+    TimeGenerated, UserPrincipalName, ClientAppUsed,
+    AuthenticationProtocol, IPAddress, AppDisplayName,
+    LocationDetails, AlertTitle, Severity, MITRE_Tactic, MITRE_Technique
+
+// ============================================================
+// TUNING NOTES:
+//   - If your org still uses legacy mail clients, you'll get FPs.
+//     The RIGHT fix is to block legacy auth in Conditional Access.
+//   - Exchange Online PowerShell is legitimate for admins —
+//     exclude specific admin accounts if needed.
+//   - Change severity to HIGH if your org has blocked legacy auth
+//     via CAP, as any success then indicates a bypass.
+//
+// RESPONSE:
+//   1. Identify if the user knowingly used a legacy auth client
+//   2. Check what actions were taken in that session (OfficeActivity)
+//   3. Long term: create a Conditional Access policy to BLOCK legacy auth
+//      This is the single highest-impact security config for M365 SMEs
+// ============================================================
+
+
+// ============================================================
+// RULE: ID-003 — Conditional Access Policy Modified or Disabled
+// ============================================================
+// MITRE ATT&CK:  T1556 — Modify Authentication Process
+// Severity:      HIGH
+// Data Source:   AuditLogs (Azure Active Directory)
+// Frequency:     Every 15 minutes | Lookback: 1 hour
+// Author:        Ismael Gaton
+//
+// Description:
+//   Detects changes to Conditional Access Policies — the most critical
+//   security controls in Azure AD. An attacker with Global Admin access
+//   will often disable or weaken CAPs to enable persistent access.
+//   Any unauthorized change to CAPs should be treated as critical.
+// ============================================================
+
+// --- CONFIGURATION ---
+let LookbackWindow = 1h;
+// --- END CONFIGURATION ---
+
+AuditLogs
+| where TimeGenerated > ago(LookbackWindow)
+| where Category == "Policy"
+| where OperationName in (
+    "Update conditional access policy",
+    "Delete conditional access policy",
+    "Disable conditional access policy",
+    "Add conditional access policy"
+)
+| extend
+    Actor = tostring(InitiatedBy.user.userPrincipalName),
+    ActorIP = tostring(InitiatedBy.user.ipAddress),
+    PolicyName = tostring(TargetResources[0].displayName),
+    PolicyId = tostring(TargetResources[0].id),
+    ChangeType = OperationName
+| extend
+    AlertTitle = "Conditional Access Policy modified — verify this was authorized",
+    Severity = "High",
+    MITRE_Tactic = "Defense Evasion",
+    MITRE_Technique = "T1556"
+| project
+    TimeGenerated, Actor, ActorIP, ChangeType,
+    PolicyName, PolicyId, Result,
+    AlertTitle, Severity, MITRE_Tactic, MITRE_Technique
+
+// ============================================================
+// TUNING NOTES:
+//   - Any change to a CAP should be verified. Legitimate changes
+//     should come from known admin accounts during business hours.
+//   - Off-hours CAP changes by unknown IPs = treat as critical.
+//   - Add a Change Management ticket requirement for CAP changes
+//     and correlate ticket numbers with this alert.
+//
+// RESPONSE:
+//   1. Verify with the admin team — was this a planned change?
+//   2. If unauthorized: revert the policy immediately
+//   3. Check what sign-ins occurred AFTER the policy was weakened
+//   4. Review all recent Global Admin activity from the same account
+//   5. If account is compromised: revoke sessions, reset password, review all changes
+// ============================================================
+
+
+// ============================================================
+// RULE: ID-004 — Azure AD Privileged Role Assigned to User
+// ============================================================
+// MITRE ATT&CK:  T1098.003 — Account Manipulation: Add Office 365 Global Administrator Role
+// Severity:      HIGH
+// Data Source:   AuditLogs (Azure Active Directory)
+// Frequency:     Every 15 minutes | Lookback: 1 hour
+// Author:        Ismael Gaton
+//
+// Description:
+//   Detects when a highly privileged Azure AD role is assigned to any user.
+//   Attackers who compromise an admin account immediately assign themselves
+//   additional privileged roles for persistence.
+//   In SMEs, Global Admin assignments outside of IT are extremely rare.
+// ============================================================
+
+// --- CONFIGURATION ---
+let LookbackWindow = 1h;
+let HighPrivilegeRoles = dynamic([
+    "Global Administrator", "Privileged Role Administrator",
+    "Security Administrator", "Exchange Administrator",
+    "SharePoint Administrator", "Teams Administrator",
+    "Intune Administrator", "Application Administrator",
+    "Cloud Application Administrator", "Authentication Administrator",
+    "Privileged Authentication Administrator", "User Administrator"
+]);
+// --- END CONFIGURATION ---
+
+AuditLogs
+| where TimeGenerated > ago(LookbackWindow)
+| where OperationName in ("Add member to role", "Add eligible member to role")
+| extend
+    Actor = tostring(InitiatedBy.user.userPrincipalName),
+    TargetUser = tostring(TargetResources[0].userPrincipalName),
+    RoleAssigned = tostring(TargetResources[1].displayName)
+| where RoleAssigned in~ (HighPrivilegeRoles)
+| extend
+    AlertTitle = strcat("High-privilege role assigned: ", RoleAssigned),
+    Severity = "High",
+    MITRE_Tactic = "Persistence",
+    MITRE_Technique = "T1098.003"
+| project
+    TimeGenerated, Actor, TargetUser, RoleAssigned,
+    AlertTitle, Severity, MITRE_Tactic, MITRE_Technique
+
+// ============================================================
+// TUNING NOTES:
+//   - Expected during onboarding of new admins — verify with HR/IT.
+//   - Off-hours assignments are high confidence malicious.
+//   - Global Administrator assigned to a non-IT account is critical.
+//   - Add Privileged Identity Management (PIM) if not already in use —
+//     it requires justification for role activations and reduces FPs here.
+//
+// RESPONSE:
+//   1. Immediately verify with the IT team — was this planned?
+//   2. If unauthorized: remove the role assignment immediately
+//   3. Review all actions taken by TargetUser since the assignment
+//   4. Check if Actor account is compromised (review their recent activity)
+//   5. Enable PIM for all privileged roles if not already configured
+// ============================================================

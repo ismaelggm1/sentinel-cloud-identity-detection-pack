@@ -1,0 +1,257 @@
+// ============================================================
+// RULE: AZ-001 — Privileged Azure Role Assignment at Subscription Level
+// ============================================================
+// MITRE ATT&CK:  T1098 — Account Manipulation
+// Severity:      HIGH
+// Data Source:   AzureActivity
+// Frequency:     Every 15 minutes | Lookback: 1 hour
+// Author:        Ismael Gaton
+//
+// Description:
+//   Detects high-privilege role assignments at the Azure subscription
+//   or management group level. Attackers who compromise a privileged
+//   account will assign themselves Owner or Contributor roles for
+//   persistent cloud access. In SMEs, these assignments should be rare.
+// ============================================================
+
+// --- CONFIGURATION ---
+let LookbackWindow = 1h;
+let HighPrivRoles = dynamic([
+    "Owner", "Contributor", "User Access Administrator",
+    "Role Based Access Control Administrator"
+]);
+// --- END CONFIGURATION ---
+
+AzureActivity
+| where TimeGenerated > ago(LookbackWindow)
+| where OperationNameValue has "roleAssignments/write"
+| where ActivityStatusValue == "Success"
+| extend
+    RoleDefinition = tostring(parse_json(tostring(parse_json(Properties).requestBody)).properties.roleDefinitionId),
+    PrincipalAssigned = tostring(parse_json(tostring(parse_json(Properties).requestBody)).properties.principalId),
+    Scope = tostring(parse_json(tostring(parse_json(Properties).requestBody)).properties.scope),
+    Actor = Caller
+| extend
+    AlertTitle = "Azure subscription-level role assignment — verify this was authorized",
+    Severity = "High",
+    MITRE_Tactic = "Persistence",
+    MITRE_Technique = "T1098"
+| project
+    TimeGenerated, Actor, PrincipalAssigned, RoleDefinition,
+    Scope, ResourceGroup, SubscriptionId,
+    AlertTitle, Severity, MITRE_Tactic, MITRE_Technique
+
+// ============================================================
+// TUNING NOTES:
+//   - Infrastructure deployments (Terraform, Bicep) create role assignments.
+//     Correlate with deployment pipelines during known provisioning activities.
+//   - Assignments to managed identities are lower risk than to user accounts.
+//   - The key risk: Owner assigned to a user account from an unusual IP.
+//
+// RESPONSE:
+//   1. Verify the Caller (Actor) — authorized admin doing this?
+//   2. Check what the PrincipalAssigned account has done since assignment
+//   3. If unauthorized: remove the role assignment immediately
+//   4. Review all Azure activity from the Caller account in last 24hrs
+// ============================================================
+
+
+// ============================================================
+// RULE: AZ-002 — Azure Resource Group or Key Resource Deleted
+// ============================================================
+// MITRE ATT&CK:  T1485 — Data Destruction
+// Severity:      HIGH
+// Data Source:   AzureActivity
+// Frequency:     Every 15 minutes | Lookback: 1 hour
+// Author:        Ismael Gaton
+//
+// Description:
+//   Detects deletion of Azure resource groups, virtual machines,
+//   databases, or storage accounts. Ransomware targeting cloud
+//   infrastructure will delete backups and critical resources.
+//   Also covers insider threat and accidental destruction scenarios.
+// ============================================================
+
+// --- CONFIGURATION ---
+let LookbackWindow = 1h;
+let CriticalResourceTypes = dynamic([
+    "Microsoft.Compute/virtualMachines",
+    "Microsoft.Storage/storageAccounts",
+    "Microsoft.Sql/servers",
+    "Microsoft.KeyVault/vaults",
+    "Microsoft.RecoveryServices/vaults",  // BACKUP VAULT — critical
+    "Microsoft.Resources/resourceGroups"
+]);
+// --- END CONFIGURATION ---
+
+AzureActivity
+| where TimeGenerated > ago(LookbackWindow)
+| where OperationNameValue has "/delete"
+| where ActivityStatusValue == "Success"
+| where ResourceProviderValue has_any (
+    "MICROSOFT.COMPUTE", "MICROSOFT.STORAGE",
+    "MICROSOFT.SQL", "MICROSOFT.KEYVAULT",
+    "MICROSOFT.RECOVERYSERVICES", "MICROSOFT.RESOURCES"
+)
+| extend
+    AlertTitle = strcat("Critical Azure resource deleted: ", ResourceId),
+    Severity = "High",
+    MITRE_Tactic = "Impact",
+    MITRE_Technique = "T1485"
+| project
+    TimeGenerated, Caller, ResourceId, ResourceGroup,
+    OperationNameValue, SubscriptionId,
+    AlertTitle, Severity, MITRE_Tactic, MITRE_Technique
+
+// ============================================================
+// TUNING NOTES:
+//   - Dev/test environments have legitimate resource teardowns.
+//     Exclude test resource groups by name if needed:
+//     | where ResourceGroup !has "test" and ResourceGroup !has "dev"
+//   - Recovery Services vault deletion should ALWAYS be investigated —
+//     that's your backup protection. No legitimate reason to delete it silently.
+//
+// RESPONSE:
+//   1. Was the deletion authorized? Check with infrastructure team.
+//   2. Attempt to recover via Azure soft-delete if within retention window
+//      Most resources have 30-90 day soft delete periods
+//   3. If malicious: revoke all access for the Caller immediately
+//   4. Assess business impact — are systems offline? Activate DR plan.
+// ============================================================
+
+
+// ============================================================
+// RULE: SP-001 — Service Principal Created with High Permissions
+// ============================================================
+// MITRE ATT&CK:  T1136.003 — Create Account: Cloud Account
+// Severity:      HIGH
+// Data Source:   AuditLogs (Azure Active Directory)
+// Frequency:     Every 30 minutes | Lookback: 2 hours
+// Author:        Ismael Gaton
+//
+// Description:
+//   Detects new service principals (app registrations) created and
+//   immediately granted high permissions. Attackers create rogue
+//   service principals as persistent backdoors — they survive password
+//   resets and MFA changes, making them a stealthy persistence mechanism.
+//   This technique was used in the 2023 Microsoft Exchange Online breach.
+// ============================================================
+
+// --- CONFIGURATION ---
+let LookbackWindow = 2h;
+// --- END CONFIGURATION ---
+
+let NewSPs = AuditLogs
+| where TimeGenerated > ago(LookbackWindow)
+| where OperationName == "Add service principal"
+| extend
+    SPName = tostring(TargetResources[0].displayName),
+    SPId = tostring(TargetResources[0].id),
+    Creator = tostring(InitiatedBy.user.userPrincipalName)
+| project TimeGenerated, SPName, SPId, Creator;
+
+let HighPermGrants = AuditLogs
+| where TimeGenerated > ago(LookbackWindow)
+| where OperationName in (
+    "Add app role assignment to service principal",
+    "Add delegated permission grant"
+)
+| extend
+    SPId = tostring(TargetResources[0].id),
+    Permission = tostring(AdditionalDetails)
+| where Permission has_any (
+    "Directory.ReadWrite.All", "Mail.ReadWrite",
+    "Files.ReadWrite.All", "User.ReadWrite.All",
+    "RoleManagement.ReadWrite.Directory", "full_access_as_user"
+)
+| project TimeGenerated, SPId, Permission;
+
+NewSPs
+| join kind=inner (HighPermGrants) on SPId
+| extend
+    AlertTitle = strcat("New service principal created with high permissions: ", SPName),
+    Severity = "High",
+    MITRE_Tactic = "Persistence",
+    MITRE_Technique = "T1136.003"
+| project
+    TimeGenerated, Creator, SPName, Permission,
+    AlertTitle, Severity, MITRE_Tactic, MITRE_Technique
+
+// ============================================================
+// TUNING NOTES:
+//   - Legitimate app development will trigger this. Verify with dev teams.
+//   - The combination of NEW + HIGH PERMISSIONS in a short window is the signal.
+//     A known app getting new permissions over time is lower risk.
+//   - Review the Creator — is it a developer or an unexpected admin account?
+//
+// RESPONSE:
+//   1. Verify with the dev/IT team — was this SP intentionally created?
+//   2. If unauthorized: delete the service principal and all its credentials
+//      Azure AD > App registrations > [App] > Delete
+//   3. Check what the SP accessed since creation (AADServicePrincipalSignInLogs)
+//   4. Review all app registrations in your tenant for unknown entries
+// ============================================================
+
+
+// ============================================================
+// RULE: AZ-003 — Azure Key Vault Bulk Secret Access
+// ============================================================
+// MITRE ATT&CK:  T1552.001 — Unsecured Credentials: Credentials In Files
+// Severity:      HIGH
+// Data Source:   AzureDiagnostics (Key Vault diagnostic settings required)
+// Frequency:     Every 30 minutes | Lookback: 1 hour
+// Author:        Ismael Gaton
+//
+// Description:
+//   Detects bulk reading of secrets from Azure Key Vault — a pattern
+//   consistent with an attacker dumping all stored credentials, API keys,
+//   and connection strings after gaining access. Key Vault contains the
+//   crown jewels for most Azure-based SME applications.
+//
+// PREREQUISITE: Enable Key Vault diagnostic logging:
+//   Key Vault > Diagnostic settings > Enable AuditEvent logs > Send to Log Analytics
+// ============================================================
+
+// --- CONFIGURATION ---
+let LookbackWindow = 1h;
+let BulkReadThreshold = 10;  // Secret reads in the lookback window
+// --- END CONFIGURATION ---
+
+AzureDiagnostics
+| where TimeGenerated > ago(LookbackWindow)
+| where ResourceType == "VAULTS"
+| where OperationName in ("SecretGet", "KeyGet", "CertificateGet")
+| where ResultType == "Success"
+| summarize
+    ReadCount = count(),
+    SecretsAccessed = make_set(id_s, 20),
+    Operations = make_set(OperationName),
+    FirstAccess = min(TimeGenerated),
+    LastAccess = max(TimeGenerated)
+    by CallerIPAddress, identity_claim_oid_g, ResourceId
+| where ReadCount >= BulkReadThreshold
+| extend
+    DurationMinutes = datetime_diff('minute', LastAccess, FirstAccess),
+    AlertTitle = "Bulk Key Vault secret access — possible credential harvesting",
+    Severity = "High",
+    MITRE_Tactic = "Credential Access",
+    MITRE_Technique = "T1552.001"
+| project
+    FirstAccess, LastAccess, DurationMinutes,
+    CallerIPAddress, identity_claim_oid_g, ResourceId,
+    ReadCount, Operations, SecretsAccessed,
+    AlertTitle, Severity, MITRE_Tactic, MITRE_Technique
+
+// ============================================================
+// TUNING NOTES:
+//   - Applications that read many secrets on startup will trigger.
+//     Identify your apps' service principal OIDs and adjust threshold.
+//   - Access from unexpected IPs or service principals is highest risk.
+//   - Adjust BulkReadThreshold to match your apps' normal startup behavior.
+//
+// RESPONSE:
+//   1. Identify the caller (identity_claim_oid_g) — known app or user?
+//   2. If unauthorized: rotate ALL secrets in the Key Vault immediately
+//   3. Check what systems use those secrets — they may be compromised
+//   4. Review Key Vault access policies and remove unnecessary permissions
+// ============================================================
